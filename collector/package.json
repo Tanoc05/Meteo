@@ -1,0 +1,16 @@
+{
+  "name": "weather-pollution-collector",
+  "version": "1.0.0",
+  "description": "Real-time weather and air quality data collector for TAP pipeline",
+  "main": "collector.js",
+  "type": "module",
+  "scripts": {
+    "start": "node collector.js",
+    "dev": "DRY_RUN=true node collector.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "kafkajs": "^2.2.4"
+  }
+}
+

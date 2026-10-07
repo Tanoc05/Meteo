@@ -1,0 +1,199 @@
+# ============================================================================
+# INFRASTRUTTURA BIG DATA TAP - Real-Time Weather & Pollution Pipeline
+# ============================================================================
+
+networks:
+  tap-network:
+    name: tap-network
+    driver: bridge
+
+volumes:
+  zookeeper-data:
+  kafka-data:
+  elasticsearch-data:
+
+services:
+  # --------------------------------------------------------------------------
+  # 1. ZOOKEEPER - Coordinamento Cluster Kafka
+  # --------------------------------------------------------------------------
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: tap-zookeeper
+    networks:
+      - tap-network
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost 2181 || exit 0"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # --------------------------------------------------------------------------
+  # 2. APACHE KAFKA - Message Broker Distribuito
+  # --------------------------------------------------------------------------
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: tap-kafka
+    depends_on:
+      - zookeeper
+    networks:
+      - tap-network
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      # Doppio listener:
+      # - PLAINTEXT://kafka:9092 per la comunicazione interna tra container Docker
+      # - PLAINTEXT_HOST://localhost:29092 per connessioni da fuori Docker (host Mac)
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "cub kafka-ready -b localhost:9092 1 20 || exit 0"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  # --------------------------------------------------------------------------
+  # 3. KAFKA TOPIC INITIALIZER - Creazione automatica dei topic
+  # --------------------------------------------------------------------------
+  kafka-init-topics:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: tap-kafka-init-topics
+    depends_on:
+      kafka:
+        condition: service_started
+    networks:
+      - tap-network
+    command: >
+      bash -c "
+        echo 'Attesa avvio broker Kafka...'
+        cub kafka-ready -b kafka:9092 1 30
+        echo 'Creazione dei Topic di progetto...'
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic weather_pollution.telemetry --partitions 3 --replication-factor 1
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic weather_pollution.alerts --partitions 3 --replication-factor 1
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic weather_pollution.ml-alerts --partitions 3 --replication-factor 1
+        kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic weather_pollution.dlq --partitions 1 --replication-factor 1
+        echo 'Topic creati con successo:'
+        kafka-topics --bootstrap-server kafka:9092 --list
+      "
+
+  # --------------------------------------------------------------------------
+  # 4. KAFKA-UI - Dashboard Web di monitoraggio code e messaggi
+  # --------------------------------------------------------------------------
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: tap-kafka-ui
+    depends_on:
+      - kafka
+    networks:
+      - tap-network
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: tap-cluster
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+      DYNAMIC_CONFIG_ENABLED: 'true'
+
+  # --------------------------------------------------------------------------
+  # 5. ELASTICSEARCH - Motore di Ricerca, Storage & Indicizzazione
+  # --------------------------------------------------------------------------
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.12.0
+    container_name: tap-elasticsearch
+    networks:
+      - tap-network
+    ports:
+      - "9200:9200"
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - xpack.security.http.ssl.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200 >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  # --------------------------------------------------------------------------
+  # 6. KIBANA - Visualizzazione Dati, Mappe Geografiche & Alert
+  # --------------------------------------------------------------------------
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.12.0
+    container_name: tap-kibana
+    depends_on:
+      - elasticsearch
+    networks:
+      - tap-network
+    ports:
+      - "5601:5601"
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - ELASTICSEARCH_SSL_VERIFICATIONMODE=none
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -I http://localhost:5601/api/status | grep -q 'HTTP/1.1 200 OK' || exit 0"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+
+  # --------------------------------------------------------------------------
+  # 7. COLLECTOR INGESTION - Microservizio Node.js (Open-Meteo -> Kafka)
+  # --------------------------------------------------------------------------
+  collector:
+    build:
+      context: ./collector
+      dockerfile: Dockerfile
+    container_name: tap-collector
+    depends_on:
+      - kafka
+      - kafka-init-topics
+    networks:
+      - tap-network
+    restart: unless-stopped
+    environment:
+      - KAFKA_BROKERS=kafka:9092
+      - KAFKA_CLIENT_ID=weather-pollution-collector
+      - KAFKA_TOPIC_TELEMETRY=weather_pollution.telemetry
+      - KAFKA_TOPIC_DLQ=weather_pollution.dlq
+      - POLL_INTERVAL_SEC=30
+      - DRY_RUN=false
+
+  # --------------------------------------------------------------------------
+  # 8. PYSPARK STREAM PROCESSOR - Aggregazioni & Alerting in Tempo Reale
+  # --------------------------------------------------------------------------
+  spark-processor:
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    container_name: tap-spark-processor
+    depends_on:
+      - kafka
+      - kafka-init-topics
+      - elasticsearch
+    networks:
+      - tap-network
+    restart: unless-stopped
+    environment:
+      - KAFKA_BROKERS=kafka:9092
+      - KAFKA_TOPIC_TELEMETRY=weather_pollution.telemetry
+      - KAFKA_TOPIC_ALERTS=weather_pollution.alerts
+      - ELASTICSEARCH_HOST=elasticsearch
+      - ELASTICSEARCH_PORT=9200
+      - SPARK_MASTER=local[*]
+
