@@ -1,16 +1,33 @@
 # ============================================================================
 # INFRASTRUTTURA BIG DATA TAP - Real-Time Weather & Pollution Pipeline
 # ============================================================================
+# Questo file Docker Compose orchestra l'intero cluster di microservizi:
+# 1. Zookeeper: Coordinamento cluster Kafka
+# 2. Kafka: Message Broker per streaming eventi
+# 3. Kafka-Init-Topics: Inizializzazione automatica dei topic
+# 4. Kafka-UI: Dashboard web di monitoraggio code (porta 8080)
+# 5. Elasticsearch: Motore di ricerca e database distribuito (porta 9200)
+# 6. Kibana: Visualizzazione geospaziale e dashboard (porta 5601)
+# 7. Collector (Node.js): Ingestion dati da Open-Meteo API verso Kafka
+# 8. Spark-Processor (PySpark): Stream processing, medie mobili e allarmi OMS
+# 9. Spark-ML (PySpark MLlib): Anomaly detection & clustering qualità dell'aria
+# 10. Kibana-Init: Configurazione automatica Data Views e Dashboards su Kibana
+# ============================================================================
 
+# Rete interna bridge condivisa da tutti i container
 networks:
   tap-network:
     name: tap-network
     driver: bridge
 
+# Volumi persistenti su disco per non perdere i dati al riavvio dei container
 volumes:
   zookeeper-data:
+    name: meteo_zookeeper-data
   kafka-data:
+    name: meteo_kafka-data
   elasticsearch-data:
+    name: meteo_elasticsearch-data
 
 services:
   # --------------------------------------------------------------------------
@@ -22,8 +39,8 @@ services:
     networks:
       - tap-network
     environment:
-      ZOOKEEPER_CLIENT_PORT: 2181
-      ZOOKEEPER_TICK_TIME: 2000
+      ZOOKEEPER_CLIENT_PORT: 2181     # Porta standard per i client Zookeeper
+      ZOOKEEPER_TICK_TIME: 2000       # Unità di tempo base in ms per gli heartbeat
     ports:
       - "2181:2181"
     volumes:
@@ -45,14 +62,14 @@ services:
     networks:
       - tap-network
     ports:
-      - "9092:9092"
-      - "29092:29092"
+      - "9092:9092"     # Porta interna / esterna per il broker
+      - "29092:29092"   # Porta di supporto per host locale
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      # Doppio listener:
-      # - PLAINTEXT://kafka:9092 per la comunicazione interna tra container Docker
-      # - PLAINTEXT_HOST://localhost:29092 per connessioni da fuori Docker (host Mac)
+      # Doppio Listener:
+      # - PLAINTEXT://kafka:9092 per le comunicazioni interne tra container Docker (Collector, Spark)
+      # - PLAINTEXT_HOST://localhost:29092 per connessioni esterne dal Mac
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
@@ -67,7 +84,7 @@ services:
       retries: 5
 
   # --------------------------------------------------------------------------
-  # 3. KAFKA TOPIC INITIALIZER - Creazione automatica dei topic
+  # 3. KAFKA TOPIC INITIALIZER - Creazione automatica dei topic all'avvio
   # --------------------------------------------------------------------------
   kafka-init-topics:
     image: confluentinc/cp-kafka:7.5.0
@@ -79,9 +96,9 @@ services:
       - tap-network
     command: >
       bash -c "
-        echo 'Attesa avvio broker Kafka...'
+        echo 'Attesa disponibilità broker Kafka...'
         cub kafka-ready -b kafka:9092 1 30
-        echo 'Creazione dei Topic di progetto...'
+        echo 'Creazione automatica dei Topic di progetto...'
         kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic weather_pollution.telemetry --partitions 3 --replication-factor 1
         kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic weather_pollution.alerts --partitions 3 --replication-factor 1
         kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic weather_pollution.ml-alerts --partitions 3 --replication-factor 1
@@ -91,7 +108,7 @@ services:
       "
 
   # --------------------------------------------------------------------------
-  # 4. KAFKA-UI - Dashboard Web di monitoraggio code e messaggi
+  # 4. KAFKA-UI - Dashboard Web di monitoraggio code e messaggi (Porta 8080)
   # --------------------------------------------------------------------------
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
@@ -109,7 +126,7 @@ services:
       DYNAMIC_CONFIG_ENABLED: 'true'
 
   # --------------------------------------------------------------------------
-  # 5. ELASTICSEARCH - Motore di Ricerca, Storage & Indicizzazione
+  # 5. ELASTICSEARCH - Database Distribuito per Storage, Ricerca & Geopoint
   # --------------------------------------------------------------------------
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:8.12.0
@@ -119,10 +136,10 @@ services:
     ports:
       - "9200:9200"
     environment:
-      - discovery.type=single-node
-      - xpack.security.enabled=false
-      - xpack.security.http.ssl.enabled=false
-      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+      - discovery.type=single-node             # Esecuzione in modalità nodo singolo
+      - xpack.security.enabled=false           # Disabilita autenticazione per semplicità locale
+      - xpack.security.http.ssl.enabled=false  # Disabilita SSL interno
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"       # Limite memoria heap Java a 512MB per leggerezza
     volumes:
       - elasticsearch-data:/usr/share/elasticsearch/data
     healthcheck:
@@ -132,7 +149,7 @@ services:
       retries: 5
 
   # --------------------------------------------------------------------------
-  # 6. KIBANA - Visualizzazione Dati, Mappe Geografiche & Alert
+  # 6. KIBANA - Visualizzazione Dati, Mappe Geografiche & Alert (Porta 5601)
   # --------------------------------------------------------------------------
   kibana:
     image: docker.elastic.co/kibana/kibana:8.12.0
@@ -182,6 +199,7 @@ services:
       context: ./spark
       dockerfile: Dockerfile
     container_name: tap-spark-processor
+    command: ["python3", "spark_stream_processor.py"]
     depends_on:
       - kafka
       - kafka-init-topics
@@ -197,3 +215,48 @@ services:
       - ELASTICSEARCH_PORT=9200
       - SPARK_MASTER=local[*]
 
+  # --------------------------------------------------------------------------
+  # 9. PYSPARK ML ANOMALY DETECTOR - Machine Learning Streaming (Fase 4)
+  # --------------------------------------------------------------------------
+  spark-ml:
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    container_name: tap-spark-ml
+    command: ["python3", "spark_ml_anomaly_detector.py"]
+    depends_on:
+      - kafka
+      - kafka-init-topics
+      - elasticsearch
+    networks:
+      - tap-network
+    restart: unless-stopped
+    environment:
+      - KAFKA_BROKERS=kafka:9092
+      - KAFKA_TOPIC_TELEMETRY=weather_pollution.telemetry
+      - KAFKA_TOPIC_ML_ALERTS=weather_pollution.ml-alerts
+      - ELASTICSEARCH_HOST=elasticsearch
+      - ELASTICSEARCH_PORT=9200
+      - SPARK_MASTER=local[*]
+
+  # --------------------------------------------------------------------------
+  # 10. KIBANA INIT - Configurazione Automatica Viste e Dashboard (Fase 5)
+  # --------------------------------------------------------------------------
+  kibana-init:
+    image: python:3.11-slim
+    container_name: tap-kibana-init
+    depends_on:
+      kibana:
+        condition: service_started
+    networks:
+      - tap-network
+    volumes:
+      - ./kibana:/app
+    working_dir: /app
+    command: >
+      bash -c "
+        pip install --no-cache-dir requests
+        python3 setup_kibana.py
+      "
+    environment:
+      - KIBANA_URL=http://kibana:5601

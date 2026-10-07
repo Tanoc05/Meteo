@@ -62,49 +62,27 @@ flowchart TD
 
 ---
 
-## 📑 Roadmap di Implementazione (Fase per Fase)
+## 📑 Roadmap di Implementazione (Completata)
 
-### ✅ Fase 1: Data Ingestion & Collector (Punto di partenza attuale)
-* Creare lo script `collector.py` (o configurazione Logstash) per interrogare le API Open-Meteo per le città target.
-* Normalizzare i campi in un payload JSON pulito:
-  ```json
-  {
-    "@timestamp": "2026-09-30T16:45:00Z",
-    "city": "Catania",
-    "country": "IT",
-    "location": { "lat": 37.50, "lon": 15.09 },
-    "temperature_c": 22.4,
-    "humidity_pct": 65.0,
-    "pressure_hpa": 1013.2,
-    "wind_speed_kmh": 12.5,
-    "pm2_5": 14.2,
-    "pm10": 28.5,
-    "no2": 18.0,
-    "so2": 3.1,
-    "co": 210.0,
-    "o3": 45.0,
-    "european_aqi": 35
-  }
-  ```
-* Pubblicare i dati su Kafka (`weather_pollution.telemetry`).
+### ✅ Fase 1: Data Ingestion & Collector
+* Realizzato microservizio Node.js `collector/collector.js` con `kafkajs` e `cities.json`.
+* Polling parallelo e normalizzazione con `@timestamp` e `location: { lat, lon }`.
+* Pubblicazione su topic Kafka `weather_pollution.telemetry`.
 
-### 🔜 Fase 2: Configurazione Infrastruttura Docker
-* Creare `docker-compose.yml` con:
-  * Zookeeper & Kafka
-  * Kafka-UI (porta 8080)
-  * Elasticsearch (porta 9200)
-  * Kibana (porta 5601)
-  * Servizio Collector/Ingestion
+### ✅ Fase 2: Configurazione Infrastruttura Docker
+* Realizzato `docker-compose.yml` con 10 microservizi integrati su `tap-network`.
+* Zookeeper, Kafka dual-listener, Kafka-UI (porta 8080), Elasticsearch (porta 9200), Kibana (porta 5601).
 
-### 🔜 Fase 3: Stream Processing con PySpark
-* `spark_stream_aggregations.py`: Medie mobili di PM10 e PM2.5 calcolate su finestre di 10 minuti per città.
-* `spark_stream_alerts.py`: Regole di allarme basate sui limiti OMS (es. PM2.5 > 25 µg/m³ o European AQI > 50).
+### ✅ Fase 3: Stream Processing con PySpark
+* Realizzato `spark/spark_stream_processor.py` con PySpark Structured Streaming.
+* Medie mobili e aggregazioni su finestre temporali di 5 min con Watermarking (`weather-pollution-aggregations`).
+* Allarmi basati su soglie OMS/UE (`weather_pollution.alerts` ed Elasticsearch `weather-pollution-alerts`).
 
-### 🔜 Fase 4: Machine Learning (Anomaly Detection)
-* Addestramento di un modello PySpark MLlib (es. KMeans per clustering di qualità dell'aria o Isolation Forest / Random Forest per anomalie di inquinamento anomalo rispetto alle condizioni meteo).
-* Inferenza in streaming su PySpark Structured Streaming.
+### ✅ Fase 4: Machine Learning (Anomaly Detection)
+* Realizzato `spark/spark_ml_anomaly_detector.py` con PySpark MLlib.
+* Pipeline K-Means Clustering su feature meteo + inquinanti (temperatura, vento, PM2.5, PM10, AQI).
+* Calcolo Anomaly Score basato su distanza euclidea dai centroidi e pubblicazione su `weather_pollution.ml-alerts` ed Elasticsearch `weather-pollution-ml-alerts`.
 
-### 🔜 Fase 5: Dashboard Kibana & Presentazione
-* Creazione di mappe con geolocalizzazione dei sensori per città.
-* Grafici temporali per andamento PM2.5 / PM10 vs Temperatura e Vento.
-* Tabelle e indicatori per gli alert in tempo reale.
+### ✅ Fase 5: Dashboard Kibana & Presentazione
+* Realizzato `kibana/setup_kibana.py` per l'importazione automatica di Data Views e Dashboard principale.
+* Mappe geospaziali, grafici temporali, indicatori live e alert real-time.
