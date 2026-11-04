@@ -132,7 +132,7 @@ async function fetchCityData({ city, country, lat, lon }) {
 async function collectAll() {
   console.log(`\n[Collector] Raccolta dati per ${cities.length} città...`);
 
-  // Esegue la raccolta per tutte le città dell'array in parallelo (Promise.all)
+  // Esegue la racco  per tutte le città dell'array in parallelo (Promise.all)
   await Promise.all(
     cities.map(async (cityInfo) => {
       // 1. Scarica il JSON normalizzato della singola città

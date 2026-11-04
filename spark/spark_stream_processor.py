@@ -1,25 +1,20 @@
 # ============================================================================
-# FASE 3: PYSPARK STREAM PROCESSOR (Versione Semplificata Unificata)
-# SCOPO: Legge in tempo reale i messaggi JSON da Kafka e in un'unica funzione
-#        (process_batch) esegue 3 operazioni:
-#        - FASE A: Salva i dati grezzi (Telemetria) su Elasticsearch
-#        - FASE B: Calcola le medie per ogni città (Aggregazioni)
-#        - FASE C: Controlla le soglie OMS (PM2.5 > 25, PM10 > 50, AQI > 50)
-#                  e invia gli allarmi sia su Elasticsearch sia su Kafka
+# FASE 3: PYSPARK STREAM PROCESSOR
+# SCOPO: 1. Legge i messaggi JSON da Kafka
+#        2. Calcola le medie per città e controlla gli allarmi OMS
+#        3. Salva tutto nel database Elasticsearch
 # ============================================================================
 
-import os       # Per leggere le variabili d'ambiente del container Docker
-import json     # Per convertire le stringhe JSON in dizionari Python
-import requests # Per inviare i dati a Elasticsearch tramite chiamate HTTP REST
+import os
+import json
+import requests
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, from_json, to_json, struct, avg, max, when, current_timestamp
 from pyspark.sql.types import StructType, StructField, StringType, DoubleType
 
 # ============================================================================
-# 1. CONFIGURAZIONE DEGLI INDIRIZZI (KAFKA ED ELASTICSEARCH)
+# 1. CONFIGURAZIONE (Indirizzi di Kafka ed Elasticsearch)
 # ============================================================================
-# Se gira in Docker usa gli indirizzi della rete interna (kafka:9092, elasticsearch:9200),
-# altrimenti usa localhost per i test diretti sul Mac
 KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "localhost:29092")
 KAFKA_TOPIC = os.getenv("KAFKA_TOPIC_TELEMETRY", "weather_pollution.telemetry")
 KAFKA_ALERTS_TOPIC = os.getenv("KAFKA_TOPIC_ALERTS", "weather_pollution.alerts")
@@ -28,11 +23,31 @@ ES_PORT = os.getenv("ELASTICSEARCH_PORT", "9200")
 ES_URL = f"http://{ES_HOST}:{ES_PORT}"
 
 # ============================================================================
-# 2. SCHEMA DEL JSON INVIATO DAL COLLECTOR
+# 2. AVVIO DI SPARK E PREPARAZIONE MAPPA ELASTICSEARCH
 # ============================================================================
-# Kafka invia i messaggi come semplice testo (stringa JSON).
-# Questo schema dice a Spark quali colonne creare nel DataFrame e di che tipo sono
-# (StringType = testo, DoubleType = numero con la virgola).
+# Dice a Elasticsearch che "location" è una coordinata GPS (geo_point) per la Mappa di Kibana
+mapping = {"mappings": {"properties": {"@timestamp": {"type": "date"}, "location": {"type": "geo_point"}}}}
+for idx in ["weather-pollution-telemetry", "weather-pollution-aggregations", "weather-pollution-alerts"]:
+    try:
+        requests.put(f"{ES_URL}/{idx}", json=mapping, timeout=3)
+    except Exception:
+        pass
+
+# Accende il motore Apache Spark con il plugin per leggere da Kafka
+spark = (
+    SparkSession.builder
+    .appName("SimpleSparkProcessor")
+    .master("local[*]")
+    .config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1")
+    .config("spark.sql.shuffle.partitions", "2")
+    .getOrCreate()
+)
+spark.sparkContext.setLogLevel("WARN")
+
+# ============================================================================
+# 3. LETTURA DEI MESSAGGI DA KAFKA (E TRASFORMAZIONE IN TABELLA)
+# ============================================================================
+# Elenco delle colonne che ci aspettiamo dentro il JSON inviato dal Collector
 schema = StructType([
     StructField("@timestamp", StringType()),
     StructField("city", StringType()),
@@ -54,96 +69,71 @@ schema = StructType([
     StructField("european_aqi", DoubleType())
 ])
 
+# Spark si collega a Kafka, legge i JSON dal topic e li trasforma in una Tabella (DataFrame)
+kafka_df = (
+    spark.readStream
+    .format("kafka")
+    .option("kafka.bootstrap.servers", KAFKA_BROKERS)
+    .option("subscribe", KAFKA_TOPIC)
+    .load()
+    .select(from_json(col("value").cast("string"), schema).alias("data"))
+    .select("data.*")
+    .filter("city IS NOT NULL")
+)
+
 # ============================================================================
-# 3. FUNZIONE HELPER PER SALVARE UN DATAFRAME SPARK SU ELASTICSEARCH
+# 4. FUNZIONE PER SALVARE UNA TABELLA SPARK SU ELASTICSEARCH
 # ============================================================================
 def send_to_es(df, index_name):
-    # Converte ogni riga della tabella Spark (DataFrame) in una stringa JSON
-    # e le raccoglie tutte in una lista Python chiamata 'records'
-    records = df.toJSON().collect()
-
-    # Se la tabella è vuota (es. 0 allarmi), non fa nulla ed esce subito
+    records = df.toJSON().collect() # Trasforma le righe della tabella in una lista di JSON
     if not records:
         return
 
-    # Scorre ogni riga JSON e la invia come documento a Elasticsearch
+    # Invia ogni riga al database Elasticsearch tramite chiamata HTTP POST
     for r in records:
-        url = f"{ES_URL}/{index_name}/_doc" # Endpoint di Elasticsearch per inserire un documento
-        documento = json.loads(r)           # Converte la stringa JSON in un dizionario Python
-        requests.post(url, json=documento)  # Invia il documento con una chiamata HTTP POST
+        url = f"{ES_URL}/{index_name}/_doc"
+        documento = json.loads(r)
+        requests.post(url, json=documento)
 
     print(f"✅ Inviati {len(records)} dati all'indice '{index_name}'")
 
 # ============================================================================
-# 4. CONFIGURAZIONE INIZIALE DI ELASTICSEARCH (MAPPING GEOSPAZIALE)
-# ============================================================================
-def init_es():
-    # Dice a Elasticsearch che il campo 'location' contiene coordinate geografiche (geo_point)
-    # così Kibana può posizionare automaticamente le città sulla mappa
-    mapping = {
-        "mappings": {
-            "properties": {
-                "@timestamp": {"type": "date"},
-                "location": {"type": "geo_point"}
-            }
-        }
-    }
-    # Applica questa configurazione a tutti e 3 gli indici prima di iniziare a scrivere i dati
-    for idx in ["weather-pollution-telemetry", "weather-pollution-aggregations", "weather-pollution-alerts"]:
-        try:
-            requests.put(f"{ES_URL}/{idx}", json=mapping, timeout=3)
-        except Exception:
-            pass
-
-# ============================================================================
-# 5. IL CUORE DEL PROCESSOR: ESEGUE TUTTE LE 3 FASI A OGNI MICRO-BATCH
+# 5. ELABORAZIONE DEI DATI (LE 3 FASI ESEGUITE OGNI 10 SECONDI)
 # ============================================================================
 def process_batch(batch_df, batch_id):
-    # Se negli ultimi 10 secondi non sono arrivati nuovi messaggi da Kafka, salta il turno
     if batch_df.isEmpty():
         return
 
     print(f"\n--- Elaborazione Blocco #{batch_id} ---")
 
-    # ------------------------------------------------------------------------
-    # FASE A: Salva i dati grezzi di telemetria così come sono arrivati
-    # ------------------------------------------------------------------------
+    # FASE A: Salva i dati grezzi così come sono arrivati da Kafka
     send_to_es(batch_df, "weather-pollution-telemetry")
 
-    # ------------------------------------------------------------------------
-    # FASE B: Raggruppa per città e calcola le medie (Aggregazioni)
-    # ------------------------------------------------------------------------
+    # FASE B: Raggruppa per città e calcola le medie (PM2.5, PM10, Temperatura, AQI Max)
     medie_df = (
-        batch_df.groupBy("city", "country") # Raggruppa le righe per nome della città
+        batch_df.groupBy("city", "country")
         .agg(
-            avg("pm2_5").alias("avg_pm2_5"),                 # Media PM2.5
-            avg("pm10").alias("avg_pm10"),                   # Media PM10
-            avg("temperature_c").alias("avg_temperature_c"), # Media Temperatura
-            max("european_aqi").alias("max_european_aqi")    # Valore massimo di AQI registrato
+            avg("pm2_5").alias("avg_pm2_5"),
+            avg("pm10").alias("avg_pm10"),
+            avg("temperature_c").alias("avg_temperature_c"),
+            max("european_aqi").alias("max_european_aqi")
         )
-        .withColumn("@timestamp", current_timestamp())       # Aggiunge l'orario del calcolo
+        .withColumn("@timestamp", current_timestamp())
     )
-    # Salva la tabella delle medie nell'indice dedicato su Elasticsearch
     send_to_es(medie_df, "weather-pollution-aggregations")
 
-    # ------------------------------------------------------------------------
-    # FASE C: Controlla i limiti OMS (WHO) e genera gli Allarmi
-    # ------------------------------------------------------------------------
+    # FASE C: Filtra solo le città che superano i limiti OMS e crea gli allarmi
     allarmi_df = (
-        # Tiene solo le città che superano almeno una soglia di pericolo OMS
         batch_df.filter("pm2_5 > 25 OR pm10 > 50 OR european_aqi > 50")
-        # Aggiunge la colonna 'alert_level': CRITICAL se PM2.5 > 50, altrimenti WARNING
         .withColumn("alert_level", when(col("pm2_5") > 50, "CRITICAL").otherwise("WARNING"))
-        # Aggiunge la colonna 'alert_reason' con la spiegazione del superamento
         .withColumn("alert_reason", when(col("pm2_5") > 25, "Superata soglia OMS PM2.5 (>25)").otherwise("AQI o PM10 elevato"))
     )
-    # 1. Salva gli allarmi su Elasticsearch nell'indice 'weather-pollution-alerts'
+    # Salva gli allarmi su Elasticsearch
     send_to_es(allarmi_df, "weather-pollution-alerts")
 
-    # 2. Se c'è almeno un allarme, lo invia anche al secondo topic Kafka 'weather_pollution.alerts'
+    # Invia gli allarmi anche al secondo topic di Kafka ('weather_pollution.alerts')
     if not allarmi_df.isEmpty():
         (
-            # Prepara il messaggio Kafka con 'key' = nome città e 'value' = tutta la riga convertita in JSON
             allarmi_df.select(col("city").alias("key"), to_json(struct("*")).alias("value"))
             .write.format("kafka")
             .option("kafka.bootstrap.servers", KAFKA_BROKERS)
@@ -152,40 +142,8 @@ def process_batch(batch_df, batch_id):
         )
 
 # ============================================================================
-# 6. AVVIO DI SPARK E ASCOLTO CONTINUO DI KAFKA
+# 6. AVVIO DEL SERVIZIO (Come 'start()' nel Collector)
 # ============================================================================
-if __name__ == "__main__":
-    # Prepara gli indici su Elasticsearch con il supporto per le mappe
-    init_es()
-
-    # Crea la sessione Spark usando tutti i core disponibili ("local[*]")
-    # e scarica automaticamente il connettore ufficiale Spark-Kafka
-    spark = (
-        SparkSession.builder
-        .appName("SimpleSparkProcessor")
-        .master("local[*]")
-        .config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1")
-        .config("spark.sql.shuffle.partitions", "2")
-        .getOrCreate()
-    )
-    # Riduce i messaggi di log interni di Spark per mantenere pulito il terminale
-    spark.sparkContext.setLogLevel("WARN")
-
-    # Si collega in modalità Streaming al topic Kafka 'weather_pollution.telemetry'
-    kafka_df = (
-        spark.readStream
-        .format("kafka")
-        .option("kafka.bootstrap.servers", KAFKA_BROKERS)
-        .option("subscribe", KAFKA_TOPIC)
-        .load()
-        # Prende il contenuto binario del messaggio Kafka ('value'), lo converte in stringa
-        # e applica lo 'schema' per trasformarlo in colonne strutturate
-        .select(from_json(col("value").cast("string"), schema).alias("data"))
-        .select("data.*")           # Espande tutte le colonne del JSON nella tabella principale
-        .filter("city IS NOT NULL") # Ignora eventuali messaggi vuoti o malformati
-    )
-
-    # Avvia lo streaming: ogni 10 secondi raccoglie i dati arrivati e li passa a 'process_batch'
-    print("🚀 Spark Processor avviato! In ascolto di Kafka...")
-    query = kafka_df.writeStream.foreachBatch(process_batch).trigger(processingTime="10 seconds").start()
-    query.awaitTermination() # Mantiene il programma sempre acceso in ascolto
+print("🚀 Spark Processor avviato! In ascolto di Kafka...")
+query = kafka_df.writeStream.foreachBatch(process_batch).trigger(processingTime="10 seconds").start()
+query.awaitTermination()
