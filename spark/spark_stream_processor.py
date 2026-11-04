@@ -142,8 +142,16 @@ def process_batch(batch_df, batch_id):
         )
 
 # ============================================================================
-# 6. AVVIO DEL SERVIZIO (Come 'start()' nel Collector)
+# 6. AVVIO DEL SERVIZIO
 # ============================================================================
 print("🚀 Spark Processor avviato! In ascolto di Kafka...")
-query = kafka_df.writeStream.foreachBatch(process_batch).trigger(processingTime="10 seconds").start()
+
+query = (
+    kafka_df.writeStream
+    .foreachBatch(process_batch)          # Passa ogni nuovo blocco di dati alla funzione 'process_batch'
+    .trigger(processingTime="10 seconds") # Esegue il controllo ogni 10 secondi
+    .start()                              # Avvia lo streaming in background
+)
+
+# Mantiene il programma sempre acceso in ascolto infinito
 query.awaitTermination()
