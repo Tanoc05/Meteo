@@ -119,8 +119,8 @@ pipeline = Pipeline(stages=[assembler, scaler, kmeans])
 trained_model = pipeline.fit(train_df)
 print("✅ Modello K-Means addestrato con successo!")
 
-# Salva le coordinate dei 3 centri (centroidi) dei cluster per calcolare le distanze
-centers = [c.tolist() for c in trained_model.stages[-1].clusterCenters()]
+# Salva le coordinate dei 3 centri (centroidi) calcolati dallo stadio 2 (kmeans)
+centers = trained_model.stages[2].clusterCenters()
 
 # Funzione che calcola la distanza (Anomaly Score) tra una città e il centro del suo cluster
 def calcola_distanza(vec, cluster_id):

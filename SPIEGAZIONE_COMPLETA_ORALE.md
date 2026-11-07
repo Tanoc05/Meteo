@@ -28,6 +28,7 @@ Effettuare il polling periodico da Open-Meteo (Meteo + Qualità dell'aria), norm
 
 ```
 [Open-Meteo APIs] ---> (fetch parallele) ---> [collector.js] ---> [Kafka: telemetry]
+
 ```
 
 ### 🗣️ Discorso da ripetere:
@@ -181,3 +182,4 @@ Quando apri il browser su `http://localhost:5601`:
 | **ML Anomaly Detector** | PySpark MLlib | Kafka (`telemetry`) | Elasticsearch (`ml-alerts`) + Kafka (`ml-alerts`) | Pipeline K-Means (k=3), scaling Z-score, Anomaly Score L2 |
 | **Elasticsearch** | Elasticsearch 8.12 | PySpark HTTP POST | Kibana (REST Queries) | Storage distribuito NoSQL, indici con mapping geospaziale `geo_point` |
 | **Kibana** | Kibana 8.12 | Elasticsearch Indici | Browser Web (`:5601`) | Dashboard unificata: mappa interattiva, KPI, grafici temporali e clustering |
+

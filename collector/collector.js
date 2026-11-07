@@ -8,8 +8,10 @@ import { Kafka, logLevel } from "kafkajs"; // Libreria client ufficiale per Apac
 import fs from "fs";                       // Modulo nativo Node.js per leggere file dal disco
 import dotenv from "dotenv";               // Modulo per caricare le variabili dal file .env
 
+
 // Carica le variabili presenti nel file .env dentro process.env
 dotenv.config();
+
 
 // ============================================================================
 // 1. CONFIGURAZIONE (Funziona sia in Docker sia sul Mac)
@@ -17,14 +19,18 @@ dotenv.config();
 // Indirizzo del server Kafka (es. "kafka:9092" in Docker oppure "localhost:29092" sul Mac)
 const KAFKA_BROKERS = (process.env.KAFKA_BROKERS || "localhost:29092").split(",");
 
+
 // Nome del canale (Topic) Kafka su cui pubblicheremo i dati grezzi
 const TOPIC = process.env.KAFKA_TOPIC_TELEMETRY || "weather_pollution.telemetry";
+
 
 // Intervallo di raccolta in millisecondi (es. 60 secondi * 1000 = 60000 ms)
 const INTERVAL_MS = (parseInt(process.env.POLL_INTERVAL_SEC, 10) || 60) * 1000;
 
+
 // Se DRY_RUN è "true", stampa i dati a schermo senza inviarli a Kafka (utile per i test)
 const DRY_RUN = process.env.DRY_RUN === "true";
+
 
 // ============================================================================
 // 2. CARICAMENTO DELLE CITTÀ DAL FILE JSON
@@ -45,10 +51,12 @@ const kafka = new Kafka({
 // Crea l'oggetto Producer che useremo per spedire i messaggi nel topic
 const producer = kafka.producer();
 
+
 // ============================================================================
 // 4. SCARICA E NORMALIZZA I DATI DI UNA SINGOLA CITTÀ DA OPEN-METEO
 // ============================================================================
 async function fetchCityData({ city, country, lat, lon }) {
+  
   // URL API 1: Meteo attuale (Temperatura, Umidità, Pressione, Vento)
   const weatherUrl = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,relative_humidity_2m,surface_pressure,wind_speed_10m`;
 
