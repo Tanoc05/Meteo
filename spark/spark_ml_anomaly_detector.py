@@ -30,8 +30,11 @@ ES_URL = f"http://{ES_HOST}:{ES_PORT}"
 
 # ============================================================================
 # 2. AVVIO DI SPARK E PREPARAZIONE MAPPA ELASTICSEARCH (Identico allo Stream Processor)
+# serve a evitare che Elasticsearch indovini i tipi di dato in modo errato (dynamic mapping).
 # ============================================================================
 mapping = {"mappings": {"properties": {"@timestamp": {"type": "date"}, "location": {"type": "geo_point"}}}}
+
+
 try:
     requests.put(f"{ES_URL}/weather-pollution-ml-alerts", json=mapping, timeout=3)
 except Exception:
@@ -45,6 +48,7 @@ spark = (
     .config("spark.sql.shuffle.partitions", "2")
     .getOrCreate()
 )
+
 spark.sparkContext.setLogLevel("WARN")
 
 # ============================================================================
@@ -119,7 +123,7 @@ pipeline = Pipeline(stages=[assembler, scaler, kmeans])
 trained_model = pipeline.fit(train_df)
 print("✅ Modello K-Means addestrato con successo!")
 
-# Salva le coordinate dei 3 centri (centroidi) calcolati dallo stadio 2 (kmeans)
+# Salva le coordinate dei 3 centri (centroidi) calcolati dallo stadio 3 (kmeans)
 centers = trained_model.stages[2].clusterCenters()
 
 # Funzione che calcola la distanza (Anomaly Score) tra una città e il centro del suo cluster

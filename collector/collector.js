@@ -1,97 +1,59 @@
 // ============================================================================
-// FASE 1: COLLECTOR METEO & QUALITÀ DELL'ARIA (Node.js Producer)
-// SCOPO: Ogni 60 secondi scarica meteo e inquinamento da Open-Meteo per le
-//        città di cities.json e invia i JSON al topic di Apache Kafka.
+// FASE 1A: COLLECTOR METEO & QUALITÀ DELL'ARIA (Node.js -> stdout JSON)
+// SCOPO: Ogni 30/60 secondi scarica meteo e inquinamento da Open-Meteo per le
+//        città di cities.json e stampa una riga JSON su stdout.
+//        Logstash legge queste righe tramite input 'pipe' e le invia a Kafka.
 // ============================================================================
 
-import { Kafka, logLevel } from "kafkajs"; // Libreria client ufficiale per Apache Kafka
-import fs from "fs";                       // Modulo nativo Node.js per leggere file dal disco
-import dotenv from "dotenv";               // Modulo per caricare le variabili dal file .env
-
-
-// Carica le variabili presenti nel file .env dentro process.env
-dotenv.config();
-
+import fs from "fs"; // Modulo nativo Node.js per leggere cities.json dal disco
 
 // ============================================================================
-// 1. CONFIGURAZIONE (Funziona sia in Docker sia sul Mac)
+// 1. CONFIGURAZIONE
 // ============================================================================
-// Indirizzo del server Kafka (es. "kafka:9092" in Docker oppure "localhost:29092" sul Mac)
-const KAFKA_BROKERS = (process.env.KAFKA_BROKERS || "localhost:29092").split(",");
-
-
-// Nome del canale (Topic) Kafka su cui pubblicheremo i dati grezzi
-const TOPIC = process.env.KAFKA_TOPIC_TELEMETRY || "weather_pollution.telemetry";
-
-
-// Intervallo di raccolta in millisecondi (es. 60 secondi * 1000 = 60000 ms)
-const INTERVAL_MS = (parseInt(process.env.POLL_INTERVAL_SEC, 10) || 60) * 1000;
-
-
-// Se DRY_RUN è "true", stampa i dati a schermo senza inviarli a Kafka (utile per i test)
-const DRY_RUN = process.env.DRY_RUN === "true";
-
+// Intervallo di raccolta in millisecondi (es. 30 secondi * 1000 = 30000 ms)
+const INTERVAL_MS = (parseInt(process.env.POLL_INTERVAL_SEC, 10) || 30) * 1000;
 
 // ============================================================================
 // 2. CARICAMENTO DELLE CITTÀ DAL FILE JSON
 // ============================================================================
-// Legge il file cities.json (testo UTF-8) e lo trasforma in un array di oggetti JavaScript
-const cities = JSON.parse(fs.readFileSync("./cities.json", "utf-8"));
+// Legge cities.json dalla stessa cartella di collector.js e lo converte in array JS
+const cities = JSON.parse(
+  fs.readFileSync(new URL("./cities.json", import.meta.url), "utf-8")
+);
 
 // ============================================================================
-// 3. INIZIALIZZAZIONE DEL PRODUCER KAFKA
-// ============================================================================
-// Configura la connessione al cluster Kafka
-const kafka = new Kafka({
-  clientId: "weather-collector", // Nome identificativo di questo microservizio
-  brokers: KAFKA_BROKERS,        // Lista dei broker Kafka a cui connettersi
-  logLevel: logLevel.WARN,       // Mostra solo avvisi o errori importanti
-});
-
-// Crea l'oggetto Producer che useremo per spedire i messaggi nel topic
-const producer = kafka.producer();
-
-
-// ============================================================================
-// 4. SCARICA E NORMALIZZA I DATI DI UNA SINGOLA CITTÀ DA OPEN-METEO
+// 3. SCARICA E NORMALIZZA I DATI DI UNA SINGOLA CITTÀ DA OPEN-METEO
 // ============================================================================
 async function fetchCityData({ city, country, lat, lon }) {
-  
   // URL API 1: Meteo attuale (Temperatura, Umidità, Pressione, Vento)
   const weatherUrl = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,relative_humidity_2m,surface_pressure,wind_speed_10m`;
 
   // URL API 2: Qualità dell'Aria attuale (PM10, PM2.5, CO, NO2, SO2, Ozono, Indice AQI Europeo)
   const airUrl = `https://air-quality-api.open-meteo.com/v1/air-quality?latitude=${lat}&longitude=${lon}&current=pm10,pm2_5,carbon_monoxide,nitrogen_dioxide,sulphur_dioxide,ozone,european_aqi`;
 
-  // Oggetti dove salveremo i dati meteo (w) e aria (a)
   let w = {};
   let a = {};
 
   try {
-    // Esegue le 2 chiamate HTTP contemporaneamente (in parallelo) per dimezzare i tempi di attesa
+    // Esegue le 2 chiamate HTTP in parallelo per dimezzare i tempi di attesa
     const [wRes, aRes] = await Promise.all([
       fetch(weatherUrl),
       fetch(airUrl),
     ]);
 
-    // Se una delle due risposte HTTP non è 200 OK (es. errore 429 Too Many Requests), lancia un errore
     if (!wRes.ok || !aRes.ok) {
       throw new Error(`HTTP ${wRes.status}`);
     }
 
-    // Converte il corpo delle due risposte da testo a oggetto JSON
     const weatherJson = await wRes.json();
     const airJson = await aRes.json();
 
-    // Open-Meteo mette le misurazioni attuali dentro la proprietà ".current" del JSON
-    // Il "|| {}" serve da protezione nel caso ".current" fosse assente
+    // Open-Meteo inserisce le misurazioni attuali dentro ".current"
     w = weatherJson.current || {};
     a = airJson.current || {};
-
   } catch {
     // SALVAGENTE AUTOMATICO (Fallback):
-    // Se Open-Meteo blocca temporaneamente le richieste o manca internet,
-    // genera valori realistici per non bloccare mai la pipeline durante la demo d'esame
+    // Se Open-Meteo va in rate-limit (HTTP 429) o manca rete, genera valori realistici
     const rand = (min, max) => +(Math.random() * (max - min) + min).toFixed(1);
     const pm25 = rand(12, 32);
 
@@ -113,74 +75,51 @@ async function fetchCityData({ city, country, lat, lon }) {
     };
   }
 
-  // Costruisce e restituisce un unico oggetto JSON pulito e piatto,
-  // pronto per essere inviato a Kafka e poi letto da Spark ed Elasticsearch
+  // Restituisce il JSON pulito e piatto pronto per la pipe verso Logstash -> Kafka
   return {
-    "@timestamp": new Date().toISOString(),           // Data e ora attuale in formato ISO (richiesto da Kibana)
-    city,                                             // Nome della città (es. "Catania")
-    country,                                          // Nazione (es. "Italy")
-    location: { lat: Number(lat), lon: Number(lon) }, // Coordinate GPS per la mappa di Kibana (geo_point)
-    temperature_c: w.temperature_2m ?? null,          // Temperatura in °C (se manca mette null)
-    humidity_pct: w.relative_humidity_2m ?? null,     // Umidità relativa in %
-    pressure_hpa: w.surface_pressure ?? null,         // Pressione atmosferica in hPa
-    wind_speed_kmh: w.wind_speed_10m ?? null,         // Velocità del vento in km/h
-    pm2_5: a.pm2_5 ?? null,                           // Polveri sottili PM2.5 (µg/m³)
-    pm10: a.pm10 ?? null,                             // Polveri sottili PM10 (µg/m³)
-    no2: a.nitrogen_dioxide ?? null,                  // Biossido di azoto (µg/m³)
-    so2: a.sulphur_dioxide ?? null,                   // Biossido di zolfo (µg/m³)
-    co: a.carbon_monoxide ?? null,                    // Monossido di carbonio (µg/m³)
-    o3: a.ozone ?? null,                              // Ozono (µg/m³)
-    european_aqi: a.european_aqi ?? null,             // Indice Europeo di Qualità dell'Aria
+    "@timestamp": new Date().toISOString(),
+    city,
+    country,
+    location: { lat: Number(lat), lon: Number(lon) },
+    temperature_c: w.temperature_2m ?? null,
+    humidity_pct: w.relative_humidity_2m ?? null,
+    pressure_hpa: w.surface_pressure ?? null,
+    wind_speed_kmh: w.wind_speed_10m ?? null,
+    pm2_5: a.pm2_5 ?? null,
+    pm10: a.pm10 ?? null,
+    no2: a.nitrogen_dioxide ?? null,
+    so2: a.sulphur_dioxide ?? null,
+    co: a.carbon_monoxide ?? null,
+    o3: a.ozone ?? null,
+    european_aqi: a.european_aqi ?? null,
   };
 }
 
 // ============================================================================
-// 5. CICLO DI RACCOLTA PER TUTTE LE CITTÀ E INVIO A KAFKA
+// 4. CICLO DI RACCOLTA PER TUTTE LE CITTÀ E STAMPA SU STDOUT PER LOGSTASH
 // ============================================================================
 async function collectAll() {
-  console.log(`\n[Collector] Raccolta dati per ${cities.length} città...`);
+  // I log informativi vanno su stderr (console.error) per non sporcare stdout,
+  // perché stdout è collegato alla pipe di Logstash che si aspetta solo righe JSON!
+  console.error(`[Collector] Raccolta dati per ${cities.length} città...`);
 
-  // Esegue la racco  per tutte le città dell'array in parallelo (Promise.all)
   await Promise.all(
     cities.map(async (cityInfo) => {
-      // 1. Scarica il JSON normalizzato della singola città
       const data = await fetchCityData(cityInfo);
 
-      // 2. Se siamo in modalità test (DRY_RUN), stampa il JSON in console e si ferma qui
-      if (DRY_RUN) return console.log(`[DRY-RUN] ${data.city}:`, JSON.stringify(data));
-
-      // 3. Invia il messaggio al topic di Apache Kafka
-      await producer.send({
-        topic: TOPIC, // Canale di destinazione: "weather_pollution.telemetry"
-        messages: [
-          {
-            key: data.city,             // Usa il nome della città come chiave di partizionamento Kafka
-            value: JSON.stringify(data) // Converte l'oggetto JS in una stringa di testo JSON
-          }
-        ],
-      });
-
-      // 4. Stampa il log di conferma con i valori principali
-      console.log(`✅ [Kafka] ${data.city} -> Temp: ${data.temperature_c}°C | PM2.5: ${data.pm2_5} | AQI: ${data.european_aqi}`);
+      // Stampa ESATTAMENTE una riga JSON su stdout -> Logstash la legge via 'pipe'
+      console.log(JSON.stringify(data));
     })
   );
 }
 
 // ============================================================================
-// 6. AVVIO DEL SERVIZIO
+// 5. AVVIO DEL SERVIZIO
 // ============================================================================
 async function start() {
-  // Apre la connessione verso il broker Kafka prima di iniziare
-  if (!DRY_RUN) await producer.connect();
-
-  console.log(`🚀 Collector avviato! Invio a Kafka (${KAFKA_BROKERS}) ogni ${INTERVAL_MS / 1000}s`);
-
-  // Esegue subito il primo giro di raccolta appena si accende il container
+  console.error(`🚀 Collector stdout avviato! Invio a Logstash ogni ${INTERVAL_MS / 1000}s`);
   await collectAll();
-
-  // Imposta un timer che ripete automaticamente collectAll() ogni INTERVAL_MS (60 secondi)
   setInterval(collectAll, INTERVAL_MS);
 }
 
-// Mette in moto il programma
 start();
