@@ -8,7 +8,7 @@
 # 4. Kafka-UI: Dashboard web di monitoraggio code (porta 8080)
 # 5. Elasticsearch: Motore di ricerca e database distribuito (porta 9200)
 # 6. Kibana: Visualizzazione geospaziale e dashboard (porta 5601)
-# 7. Collector (Node.js): Ingestion dati da Open-Meteo API verso Kafka
+# 7. Collector (Node.js + Logstash): Ingestion dati da Open-Meteo via pipe verso Kafka
 # 8. Spark-Processor (PySpark): Stream processing, medie mobili e allarmi OMS
 # 9. Spark-ML (PySpark MLlib): Anomaly detection & clustering qualità dell'aria
 # 10. Kibana-Init: Configurazione automatica Data Views e Dashboards su Kibana
@@ -170,7 +170,7 @@ services:
       retries: 5
 
   # --------------------------------------------------------------------------
-  # 7. COLLECTOR INGESTION - Microservizio Node.js (Open-Meteo -> Kafka)
+  # 7. COLLECTOR + LOGSTASH - Ingestion (Node.js stdout -> Logstash pipe -> Kafka)
   # --------------------------------------------------------------------------
   collector:
     build:
@@ -185,11 +185,10 @@ services:
     restart: unless-stopped
     environment:
       - KAFKA_BROKERS=kafka:9092
-      - KAFKA_CLIENT_ID=weather-pollution-collector
       - KAFKA_TOPIC_TELEMETRY=weather_pollution.telemetry
-      - KAFKA_TOPIC_DLQ=weather_pollution.dlq
       - POLL_INTERVAL_SEC=30
-      - DRY_RUN=false
+      - LS_JAVA_OPTS=-Xms256m -Xmx256m
+      - XPACK_MONITORING_ENABLED=false
 
   # --------------------------------------------------------------------------
   # 8. PYSPARK STREAM PROCESSOR - Aggregazioni & Alerting in Tempo Reale
