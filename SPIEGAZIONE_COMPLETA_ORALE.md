@@ -2,7 +2,7 @@
 
 Questa guida raccoglie l'esposizione completa e corretta del progetto per l'esame di **Technologies for Advanced Programming (TAP)**.  
 È pensata per essere ripetuta a voce in modo fluido, chiaro e tecnicamente ineccepibile davanti al Professore, coprendo l'intero flusso dati e i tre script centrali del progetto:
-1. **Collector Node.js** (`collector/collector.js`)
+1. **Collector Node.js + Logstash** (`collector/collector.js` + `collector/logstash.conf`)
 2. **PySpark Stream Processor** (`spark/spark_stream_processor.py`)
 3. **PySpark MLlib Anomaly Detector** (`spark/spark_ml_anomaly_detector.py`)
 
@@ -12,7 +12,7 @@ Questa guida raccoglie l'esposizione completa e corretta del progetto per l'esam
 
 > *"Il nostro progetto realizza una pipeline Big Data in tempo reale per il monitoraggio della qualità dell'aria e delle condizioni meteo su 12 importanti città italiane ed europee.*  
 > *L'architettura è suddivisa in cinque macro-fasi:*
-> 1. ***Data Ingestion***: un microservizio Node.js interroga le API REST di Open-Meteo ogni 60 secondi.
+> 1. ***Data Ingestion***: uno script Node.js interroga le API REST di Open-Meteo e stampa i JSON su `stdout`; **Logstash** li raccoglie tramite una `pipe` e li inoltra a Kafka.
 > 2. ***Message Brokering***: Apache Kafka disaccoppia chi produce i dati da chi li consuma, canalizzandoli in topic dedicati.
 > 3. ***Stream Processing***: un primo consumer Apache Spark Structured Streaming calcola aggregazioni e allarmi basati sulle soglie OMS.
 > 4. ***Machine Learning in Streaming***: un secondo consumer Spark MLlib esegue una pipeline K-Means (k=3) per classificare lo stato dell'aria e calcola una distanza euclidea rispetto al centroide per identificare anomalie complesse.
@@ -21,48 +21,38 @@ Questa guida raccoglie l'esposizione completa e corretta del progetto per l'esam
 
 ---
 
-## 1️⃣ FASE 1: Data Ingestion (`collector/collector.js`)
+## 1️⃣ FASE 1: Data Ingestion (`collector/collector.js` + `collector/logstash.conf`)
 
-### 🎯 Ruolo dello script
-Effettuare il polling periodico da Open-Meteo (Meteo + Qualità dell'aria), normalizzare i dati in formato JSON ed effettuare il push sul topic Kafka `weather_pollution.telemetry`.
+### 🎯 Ruolo del modulo
+Separare in modo pulito il **recupero dati** dal **trasporto verso Kafka**:
+- **`collector.js` (Node.js)**: scarica in parallelo meteo e qualità dell'aria da Open-Meteo ogni 30/60 secondi e stampa una riga JSON su `stdout`.
+- **`logstash.conf` (Logstash)**: esegue `node /app/collector.js` tramite il plugin `input { pipe }`, pulisce i metadati tecnici e spedisce gli eventi al topic Kafka `weather_pollution.telemetry`.
 
 ```
-[Open-Meteo APIs] ---> (fetch parallele) ---> [collector.js] ---> [Kafka: telemetry]
-
+[Open-Meteo APIs] ---> [collector.js (stdout JSON)] === pipe ===> [Logstash] ---> [Kafka: telemetry]
 ```
 
 ### 🗣️ Discorso da ripetere:
-1. **Perché JavaScript/Node.js?**  
-   *"Abbiamo scelto Node.js per il Collector perché è nativamente asincrono, leggero e ideale per compiti I/O-intensive come effettuare richieste HTTP di rete e pubblicare messaggi JSON senza bloccare l'event loop."*
+1. **Perché Node.js + Logstash con `pipe`?**  
+   *"Abbiamo combinato il meglio dei due mondi: `collector.js` in Node.js è leggerissimo e ideale per eseguire in parallelo con `Promise.all` le chiamate HTTP verso le due API di Open-Meteo, ma **non contiene nessun codice legato a Kafka**. Si limita a stampare un JSON pulito per ogni città su `stdout`. È poi **Logstash** (parte ufficiale dello stack ELK) che legge lo streaming dalla `pipe`, lo normalizza e si occupa della consegna affidabile verso Apache Kafka."*
 
-2. **Import e Variabili d'ambiente (Righe 7-18):**  
-   *"Importiamo `kafkajs` (il client Kafka ufficiale per Node.js), `fs` (per la lettura file su disco) e `dotenv` per caricare le variabili d'ambiente.  
-   Configuriamo i parametri di runtime: `KAFKA_BROKERS` (che in Docker punta a `kafka:9092` e sul Mac a `localhost:29092`), il topic di telemetria, l'intervallo di polling impostato a 60 secondi (`60.000 ms`) e la variabile booleana `DRY_RUN` utile per testare lo script in console senza un broker attivo."*
+2. **Configurazione e Caricamento Città (`collector.js`, Righe 7-22):**  
+   *"Importiamo solo `fs` per leggere dal disco `cities.json` (con `new URL("./cities.json", import.meta.url)`), impostiamo l'intervallo `INTERVAL_MS` tramite la variabile d'ambiente `POLL_INTERVAL_SEC` e trasformiamo l'elenco delle 12 città in un array JavaScript con `JSON.parse`."*
 
-3. **Caricamento Città e Producer Kafka (Righe 20-24):**  
-   *"Leggiamo in modo sincrono il file `cities.json` con `fs.readFileSync` e lo convertiamo in array JavaScript con `JSON.parse`.  
-   Inizializziamo il client Kafka impostando `logLevel.WARN` per evitare che la console venga inondata da log di heartbeat interni, e creiamo l'oggetto `producer` tramite cui spedire i record."*
+3. **Funzione `fetchCityData({ city, country, lat, lon })` (Righe 27-95):**  
+   *"Per ciascuna città interroghiamo in parallelo con **`Promise.all([fetch(weatherUrl), fetch(airUrl)])`** i due endpoint Open-Meteo (Meteo + Qualità dell'Aria). Estraiamo i dati attuali dentro `.current` (`w = weatherJson.current || {}` e `a = airJson.current || {}`).  
+   **Il blocco di Catch (Salvagente):** se Open-Meteo restituisce un errore HTTP 429 (rate limiting) o cade internet, il `catch` genera valori plausibili casuali così la pipeline non si blocca mai durante la demo.  
+   La funzione restituisce un JSON piatto con `@timestamp`, città, nazione, `location: { lat, lon }` e tutti i parametri ambientali."*
 
-4. **Funzione `fetchCityData({ city, country, lat, lon })` (Righe 27-93):**  
-   *"Per ciascuna città dobbiamo consultare due endpoint REST distinti di Open-Meteo:  
-   - `weatherUrl`: per temperatura, umidità, pressione e velocità del vento;  
-   - `airUrl`: per inquinanti (PM10, PM2.5, NO2, SO2, CO, Ozono e l'indice europeo AQI).  
-   
-   Usiamo **`Promise.all([fetch(weatherUrl), fetch(airUrl)])`** per effettuare le due chiamate HTTP in parallelo anziché in sequenza, dimezzando i tempi di attesa.  
-   Open-Meteo inserisce i dati in tempo reale all'interno della proprietà `.current` del JSON di risposta; pertanto estraiamo `w = weatherJson.current || {}` e `a = airJson.current || {}`.  
-   
-   **Il blocco di Catch (Salvagente):** se Open-Meteo restituisce un errore HTTP 429 (rate limiting) o se cade la connessione, il `catch` genera valori plausibili casuali, garantendo che la pipeline non vada in crash durante la dimostrazione.  
-   
-   La funzione restituisce un JSON normalizzato piatto, contenente il timestamp ISO (`@timestamp`), la città, la nazione e la struttura `location: { lat, lon }` pronta per l'indicizzazione geospaziale."*
+4. **Funzione `collectAll()` e separazione `stdout` / `stderr` (Righe 100-115):**  
+   *"Con `cities.map` e `Promise.all` raccogliamo tutte e 12 le città insieme.  
+   Un dettaglio tecnico importante: i messaggi di log umani usano `console.error(...)` (canale `stderr`), mentre **`console.log(JSON.stringify(data))`** stampa **solo righe JSON pure** su `stdout`, così la pipe di Logstash riceve esclusivamente dati validi."*
 
-5. **Funzione `collectAll()` (Righe 96-114):**  
-   *"Tramite `cities.map` e un ulteriore `await Promise.all(...)` eseguiamo la raccolta per tutte le 12 città simultaneamente.  
-   Per ciascuna città chiamiamo `producer.send(...)`:  
-   - nel campo **`key`** impostiamo il nome della città (`data.city`), garantendo che i messaggi della stessa città finiscano nella medesima partizione di Kafka mantenendo l'ordine cronologico;  
-   - nel campo **`value`** serializziamo l'oggetto in stringa tramite `JSON.stringify(data)`."*
-
-6. **Avvio `start()` (Righe 117-125):**  
-   *"Apre la connessione al broker con `await producer.connect()`, esegue subito la prima raccolta dati al secondo zero (`await collectAll()`) e attiva un timer ciclico con `setInterval(collectAll, INTERVAL_MS)` ogni 60 secondi."*
+5. **La configurazione di Logstash (`collector/logstash.conf`):**  
+   *"Il file di configurazione Logstash è diviso nei 3 blocchi classici:*  
+   - ***`input { pipe }`***: *avvia `node /app/collector.js` con `codec => json` (perché il plugin `pipe` divide già le righe ad ogni `\n`).*  
+   - ***`filter { mutate }`***: *rimuove i campi di servizio aggiunti da Logstash (`@version`, `host`, `process`, `event`) lasciando intatto il nostro schema JSON.*  
+   - ***`output { kafka }`***: *invia l'evento al broker `kafka:9092` sul topic `weather_pollution.telemetry`, usando `message_key => "%{city}"` per garantire il partizionamento ordinato per città."*
 
 ---
 
@@ -176,7 +166,7 @@ Quando apri il browser su `http://localhost:5601`:
 
 | Componente | Linguaggio / Tech | Input | Output / Destinazione | Ruolo Principale |
 | :--- | :--- | :--- | :--- | :--- |
-| **Collector** | Node.js (JavaScript) | Open-Meteo REST API | Kafka (`telemetry`) | Ingestion asincrona, fallback su 429, serializzazione JSON |
+| **Collector + Logstash** | Node.js + Logstash 8.12 | Open-Meteo REST API (`stdout` -> `pipe`) | Kafka (`telemetry`) | Ingestion asincrona, pulizia campi (`mutate`), invio a Kafka |
 | **Kafka Broker** | Confluent Kafka 7.5 | Collector & Spark | Spark & Kafka-UI | Disaccoppiamento, buffering e persistenza a partizioni |
 | **Stream Processor** | PySpark (Structured Streaming) | Kafka (`telemetry`) | Elasticsearch (`telemetry`, `aggregations`, `alerts`) + Kafka (`alerts`) | Schema mapping, medie aggregate per città, regole sanitarie OMS |
 | **ML Anomaly Detector** | PySpark MLlib | Kafka (`telemetry`) | Elasticsearch (`ml-alerts`) + Kafka (`ml-alerts`) | Pipeline K-Means (k=3), scaling Z-score, Anomaly Score L2 |
